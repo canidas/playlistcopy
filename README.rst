@@ -1,11 +1,6 @@
 playlistcopy
 ------------
 
-:Authors:
-    Den <dev@den.cx>
-:Copyright: Copyright © 2014 Den <dev@den.cx>
-:Licence: GPLv3+
-
 playlistcopy is a Python 3 program for randmomized copying tracks
 playlist of (M3U/M3U8) to a destination device.
 
@@ -35,6 +30,11 @@ multiprocessing. The placement of tracks is randomized because the random
 alogrithm of Kenwood devices seem to only randomize files but not directories.
 I made some things optional in the hope that somebody could use it for
 other features playlistcopy has also built in.
+
+License
+=======
+
+playlistcopy is licensed under the terms of GPLv3+.
 
 Dependencies
 ============

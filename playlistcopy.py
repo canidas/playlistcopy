@@ -1,374 +1,405 @@
-""" playlistcopy is a Python 3 program for randmomized copying tracks
-playlist of (M3U/M3U8) to a destination device.
-
-See readme.rst for more information.
-
-Dependencies:
-    * Python 3.1 (at least)
-    * hsaudiotag3k
-    * chardet (optional)
-
-License: GPLv3+
-"""
+#!/usr/bin/env python3
 
 import argparse
-import codecs
 import collections
-import os
 import logging
-import multiprocessing as mp
-import multiprocessing.sharedctypes
-import shutil
-import subprocess
+import os
 import random
 import re
-import tempfile
+import shutil
 
 try:
     import chardet
 except ImportError:
     chardet = None
 
-from hsaudiotag import auto  # hsaudiotag3k
-
 
 class PlaylistCopy:
-    """ Class for reading multiple playlists (M3U-format) and
+    """ playlistcopy is a Python 3 program for merging and copying (and
+    syncing) several tracks of several playlists (m3u/m3u8) to a destination
+    device, even splitted in folders and shuffled.
+
+    Dependencies:
+        * Python 3.1 (at least)
+        * hsaudiotag3k (semi-optional)
+        * chardet (optional)
+
+    Licence:
+        GPLv3+
     """
-    _file_types = ('mp3', 'm4a', 'wav')  # Supported by Kenwood
-    _folder_name = 'Folder %d'  # %d is count
+    def __init__(self, destination, playlists, mode='sync', rewrite_file_names=True, tracks_per_folder=0,
+                 shuffle=False, folder_name='Folder %d', verbose=False, dry_run=False):
+        self.destination = destination
+        self.playlists = playlists
+        self.mode = mode
+        self.rewrite_file_names = rewrite_file_names
+        self.tracks_per_folder = tracks_per_folder
+        self.shuffle = shuffle
+        self.folder_name = folder_name
+        self.dry_run = dry_run
 
-    def __init__(self, dst_dir, playlists, lame_bin=None, tracks_per_dir=0,
-                 randomize_tracks=True, convert_jobs=1, move_jobs=1, quiet=False):
-        """ Constructor
+        self.playlists_files = []
+        self.playlists_files_rewritten = collections.OrderedDict()  # New name -> fs path
+        self.destination_files = []
+        self.destination_folders = collections.OrderedDict()  # Number of files per folder
 
-        :param dst_dir: Destination directory
-        :param playlists: List of path to playlist paths
-        :param lame_bin: Path to LAME binary
-        :param tracks_per_dir: Maximum tracks per directory. 0 disables splitting.
-        :param randomize_tracks: Randomize tracks? Only useful for tracks_per_dir.
-        :param convert_jobs: Process count for converting jobs
-        :param move_jobs: Process count for moving jobs
-        :param quiet: Suppress print()-output
-        """
-        self._dst_dir = dst_dir
-        self._playlists = playlists
-        self._lame_bin = lame_bin
-        self._tracks_per_dir = tracks_per_dir
-        self._randomize_tracks = randomize_tracks
-        self._convert_jobs_count = convert_jobs
-        self._move_job_count = move_jobs
-        self._quiet = quiet
-
-        self._tmp_dir = tempfile.mkdtemp()
-        self._logger = mp.get_logger()
-        self._playlist_tracks = set()
-        self._sync_tracks = collections.OrderedDict()
-        self._dst_tracks = set()  # lowered values
-        self._dst_dir_dirs = collections.OrderedDict()
-
-        if lame_bin is not None and not os.path.isfile(self._lame_bin):
-            raise FileNotFoundError('lame executable not found')
+        self.logger = logging.Logger(__name__)
+        level = logging.WARNING if not verbose else logging.DEBUG
+        console = logging.StreamHandler()
+        console.setLevel(level)
+        self.logger.addHandler(console)
+        self.logger.setLevel(level)
 
     def run(self):
-        """ Run processes
+        """ Start process
         """
-        self._get_files_of_dst()
+        for playlist_file in self.playlists:
+            self._parse_playlist(playlist_file)
 
-        logging.info('Parsing %d playlists' % len(self._playlists))
+        self._build_rewritten_filenames()
+        self._build_destination_file_list()
 
-        for pl in self._playlists:
-            self._parse_playlist(pl)
+        self._sync()
 
-        if not self._quiet:
-            print('Playlists contain %d new items' % len(self._sync_tracks))
-
-        if len(self._sync_tracks) > 0:
-            self._determine_dst_locations()
-            self._start_jobs()
-
-        # Clean-up
-        try:
-            shutil.rmtree(self._tmp_dir)
-        except PermissionError:
-            # It's possible that _move_job and rmtree try to delete the same file
-            pass
-
-        if not self._quiet:
-            print('Finished')
-
-    def _start_jobs(self):
-        """ Start all worker processes and wait for finish
-
-        TODO: Rewrite entire process communication. copy_queue.join() deadlocks
-        when processing many tracks. But without this join, the last could be
-        skipped while copying because the parent process terminates the copy
-        worker. The current deadlock is the better approch because all files
-        will still be copied and only the empty temporary directory won't be
-        deleted.
+    def _parse_playlist(self, file):
+        """ Parse a M3U playlist
         """
-        # Queues for mp
-        convert_queue = mp.JoinableQueue()
-        copy_queue = mp.JoinableQueue()
-        for track in self._sync_tracks.values():
-            convert_queue.put(track)
+        file_dir = os.path.dirname(os.path.realpath(file))
 
-        todo_tracks = convert_queue.qsize()
-        done_tracks = mp.sharedctypes.Value('d', 0)
-
-        # Start converter processes
-        for i in range(self._convert_jobs_count):
-            p = mp.Process(target=_convert_job, name='ConvProcess-%d' % i,
-                           args=(convert_queue, copy_queue, self._tmp_dir, self._lame_bin))
-            p.daemon = True
-            p.start()
-
-        # Start move processes
-        for i in range(self._move_job_count):
-            p = mp.Process(target=_move_job, name='MoveProcess-%d' % i,
-                           args=(copy_queue, todo_tracks, done_tracks, self._quiet))
-            p.daemon = True
-            p.start()
-
-        # Wait for all workers to finish
-        convert_queue.join()
-        copy_queue.join()  # Deadlock if there are many tracks
-
-    def _get_files_of_dst(self):
-        """ Build list of all tracks of destination
-        """
-        def add_file(file, directory_number):
-            self._dst_tracks.add(file.lower())  # lowering is important
-            self._dst_dir_dirs[directory_number].add(file)
-
-        for f in os.listdir(self._dst_dir):
-            path = os.path.join(self._dst_dir, f)
-
-            # Don't iterate through sub directories when no folders are used
-            if self._tracks_per_dir == 0:
-                self._dst_dir_dirs[1] = set()
-                add_file(f, 1)
-            else:
-                # Ignore files in destination root directory
-                if not os.path.isdir(path):
-                    continue
-
-                # Extract directory number
-                try:
-                    folder_name_format = self._folder_name.replace('%d', r'(\d+)')
-                    number = int(re.findall(r'^%s$' % folder_name_format, f)[0])
-                except IndexError:
-                    continue  # Folder name doesn't match format
-
-                self._dst_dir_dirs[number] = set()
-
-                # Iterate through sub directories
-                for f2 in os.listdir(path):
-                    path2 = os.path.join(self._dst_dir, f, f2)
-                    if not os.path.isfile(path2):
-                        continue  # Ignore sub sub directories
-                    add_file(f2, number)
-
-    def _parse_playlist(self, pl):
-        """ Build initial list of files (read playlists)
-        """
-        pl_path = os.path.dirname(os.path.realpath(pl))
-        pl_name = os.path.splitext(os.path.basename(pl))[0]
-
-        # Deal with file encoding, BOM
+        # Deal with file encoding
         encoding = None
-        raw = open(pl, 'rb').read(min(32, os.path.getsize(pl)))
-        if raw.startswith(codecs.BOM_UTF8):
-            encoding = 'utf-8-sig'
-        elif chardet is not None:
-            result = chardet.detect(raw)
+        if chardet is not None:
+            result = chardet.detect(open(file, 'rb').read())
             encoding = result['encoding']
 
-        with open(pl, 'r', encoding=encoding) as f:
+        with open(file, 'r', encoding=encoding) as f:
             for line in f:
                 if line.startswith('#'):
                     continue  # Ignore M3U directives
-
-                src_path = os.path.join(pl_path, line.replace('\n', ''))
-
-                # Some hard checks
-                if not os.path.isfile(src_path):
-                    raise FileNotFoundError('File "%s" does not exists!' % src_path)
-                if not src_path.endswith(self._file_types):
-                    raise IOError('File "%s" is not in %s!' % (src_path, self._file_types))
-
-                # Generate new filename
-                tags = auto.File(src_path)
-                dst_name = '%s - %s (%s)' % (tags.artist, tags.title, pl_name)
-                dst_name = re.sub('[^\w\s()-\.\']', '', dst_name).strip()
-                ext = os.path.splitext(src_path)[-1]
-                dst_name_ext = ''
-
-                # Check if file with same potential filename already exists in same PL
-                # If so, append (1), (2), etc. to filename
-                nth_file = 0
-                while True:
-                    nth_file += 1
-                    nth = ' (%d)' % nth_file if nth_file > 1 else ''
-                    dst_name_ext = '%s%s%s' % (dst_name, nth, ext)
-
-                    if dst_name_ext not in self._playlist_tracks:
-                        break
-
-                # It's important to always have a list of all tracks of all playlists
-                # That's important for correct working of the above check
-                self._playlist_tracks.add(dst_name_ext)
-
-                # Skip file if file with filename already exists on destination
-                # Lowering is important for tracks with same artist and title
-                #   on same playlist because of ordering problems
-                # Example: Same artist, same title, different album,
-                #   some letter lowercase instead of uppercase
-                if dst_name_ext.lower() in self._dst_tracks:
-                    self._logger.info('Skipping file (already exists) %s' % dst_name_ext)
+                full_path = os.path.join(file_dir, line.rstrip())
+                if not os.path.isfile(full_path):
+                    self.logger.warning('File doesn\'t exist and is skipped: %s' % full_path)
                 else:
-                    self._sync_tracks[dst_name_ext] = [dst_name_ext, src_path, '']
+                    self.playlists_files.append(full_path)
 
-    def _determine_dst_locations(self):
-        """ Determine where to place which track
+    def _build_destination_file_list(self):
+        """ Build list of all files of destination folder
         """
-        # Randomize tracks (only if dirs are being created)
-        tracks = list(self._sync_tracks.keys())
-        if self._randomize_tracks and self._tracks_per_dir != 0:
-            random.shuffle(tracks)
+        for f in os.listdir(self.destination):
+            path = os.path.join(self.destination, f)
 
-        i = 0
-        while True:
-        #for i in range(1, 255):  # 254 = max. folder count (255 is /)
-            i += 1
-
-            if len(tracks) == 0:
-                break  # No tracks left, so break
-
-            folder_name = self._folder_name % i
-            folder_path = os.path.join(self._dst_dir, folder_name)
-
-            # Track count per directory check
-            if self._tracks_per_dir != 0:
-                # If folder already exists, check file count
-                if i in self._dst_dir_dirs:
-                    tracks_in_dir = len(self._dst_dir_dirs[i])
-                    if tracks_in_dir >= self._tracks_per_dir:
-                        continue  # Skip this full directory
-                    else:
-                        remainder = self._tracks_per_dir - tracks_in_dir
-                else:
-                    # Create new directory
-                    os.mkdir(folder_path)
-                    remainder = self._tracks_per_dir
+            # Don't iterate through sub directories when no folders are used
+            if self.tracks_per_folder == 0:
+                if os.path.isfile(path):
+                    self.destination_files.append(path)
             else:
-                remainder = len(tracks)  # Remainer is as high as track count
-                folder_path = self._dst_dir  # No directory must be created
+                # Check if folder name matchs folder name format
+                folder_number = self._extract_folder_number(f)
+                if folder_number is None:
+                    continue  # Folder name doesn't match format
 
-            # Allocate track to destination directory
-            for j in range(remainder):
+                self.destination_folders[folder_number] = 0
+                for f2 in os.listdir(path):
+                    path2 = os.path.join(self.destination, f, f2)
+                    if os.path.isfile(path2):  # Ignore sub sub directories
+                        self.destination_files.append(path2)
+                        self.destination_folders[folder_number] += 1
+
+    def _build_rewritten_filenames(self):
+        """ Rewrite file names of playlists for destination folder
+        """
+        for k, f in enumerate(self.playlists_files):
+            name, ext = os.path.splitext(os.path.basename(f))
+
+            # Rewrite file names to ID3 tags
+            # TODO Maximum filename length on some file systems
+            if self.rewrite_file_names:
+                from hsaudiotag import auto  # hsaudiotag3k
+                tags = auto.File(f)
+                if not tags.artist.strip():
+                    raise IOError('Tag artist is empty %s' % f)
+                if not tags.album.strip():
+                    raise IOError('Tag album is empty %s' % f)
+                if not tags.title.strip():
+                    raise IOError('Tag title is empty %s' % f)
+                name = '%s - %s - %s' % (tags.artist, tags.album, tags.title)  # Actually - should be –
+                name = re.sub('[^\w\s()-\.\']', '', name).strip()
+
+            # Check if file with same potential filename already exists in same PL
+            # If so, append (1), (2), etc. to filename
+            nth_file = 0
+            while True:
+                nth_file += 1
+                nth = ' (%d)' % nth_file if nth_file > 1 else ''
+                new_name = '%s%s' % (name, nth)
+                # Compare lowered names, needed for case-insensitive file systems
+                rewritten_lower = map(lambda n: n.lower(), self.playlists_files_rewritten.values())
+                if (new_name + ext).lower() not in rewritten_lower:
+                    name = new_name
+                    break
+
+            self.playlists_files_rewritten[k] = name + ext
+
+    def _compare(self):
+        """ Determine which tracks become added and which tracks become removed
+        """
+        # Filenames for comparison (lowered names needed for case-insensitive file systems)
+        pl_filenames = [name.lower() for name in self.playlists_files_rewritten.values()]
+        dst_filenames = [os.path.basename(f).lower() for f in self.destination_files]
+
+        # Some assertions
+        if len(self.playlists_files) != len(set(self.playlists_files_rewritten)):
+            raise AssertionError('Playlist files don\'t contain unique filenames only (error in file renaming?)')
+        if len(dst_filenames) != len(set(dst_filenames)):
+            raise AssertionError('Destination files don\'t contain unique filenames only (across all folders)')
+
+        # Compare: New files and files to delete (only compare filenames)
+        additions = collections.OrderedDict()
+        deletions = {}
+        for k, name in enumerate(pl_filenames):
+            if name not in dst_filenames:
+                additions[k] = self.playlists_files[k]
+        for k, dst_file in enumerate(dst_filenames):
+            if dst_file not in pl_filenames:
+                deletions[k] = self.destination_files[k]
+
+        return additions, deletions
+
+    def _sync(self):
+        """ Sync: Get additions and deletions, shuffling, execute sync
+        """
+        additions, deletions = self._compare()
+
+        if self.mode == 'sync':
+            info_deletions = '%d deletions' % len(deletions)
+        else:
+            info_deletions = '0 deletions (disabled)'
+        self.logger.warning('%d additions, %s' % (len(additions), info_deletions))
+
+        if self.dry_run:
+            self.logger.warning('PERFORMING DRY RUN')
+
+        # In sync mode: delete files not matched
+        if self.mode == 'sync':
+            self._sync_deletions(deletions)
+
+        if self.shuffle:  # Shuffle works only for new tracks here
+            keys = list(additions)
+            random.shuffle(keys)
+            for k in keys:
+                additions.move_to_end(k)
+
+        self._sync_additions(additions)
+
+    def _sync_additions(self, additions):
+        """ Sync additions: Create needed folders and copy files
+        """
+        folder_mapping = self._prepare_copying_additions(additions)
+
+        tracks_done = 0
+        for k, f in additions.items():
+            tracks_done += 1
+            dst_path = os.path.join(folder_mapping[k], self.playlists_files_rewritten[k])
+            percent = tracks_done / len(additions) * 100
+            self.logger.info('Copying file %s -> %s (%.2f%%)' % (f, dst_path, percent))
+            if not self.dry_run:
+                shutil.copyfile(f, dst_path)
+
+    def _prepare_copying_additions(self, additions):
+        """ Prepare copying: Create folders and allocate files to folders
+        """
+        mapping = {}
+        tracks_stack = additions.copy()
+        folder_count = 0
+
+        while True:
+            folder_count += 1
+
+            if len(tracks_stack) == 0:
+                break
+
+            if self.tracks_per_folder != 0:
+                folder_path = os.path.join(self.destination, self.folder_name % folder_count)
+
+                # Create needed folder which currently does not exist
+                if folder_count not in self.destination_folders:
+                    self.logger.info('Creating folder "%s"' % folder_path)
+                    if not self.dry_run:
+                        os.mkdir(folder_path)
+
+                    self.destination_folders[folder_count] = 0
+                    remainder = self.tracks_per_folder
+                else:
+                    tracks_in_folder = self.destination_folders[folder_count]
+                    if tracks_in_folder >= self.tracks_per_folder:
+                        continue  # Skip full folder
+                    else:
+                        remainder = self.tracks_per_folder - tracks_in_folder
+            else:
+                remainder = len(tracks_stack)  # Remainer is as high as track count
+                folder_path = self.destination  # No directory must be created
+
+            # Allocate tracks to folder
+            for i in range(remainder):
                 try:
-                    track = tracks.pop(0)
-                    self._sync_tracks[track][2] = os.path.join(folder_path, track)
-                except IndexError:
+                    track = tracks_stack.popitem(False)
+                    mapping[track[0]] = folder_path
+                    if self.tracks_per_folder != 0:
+                        self.destination_folders[folder_count] += 1
+                except KeyError:
                     break  # No more tracks left
 
+        return mapping
 
-def _convert_job(convert_queue, copy_queue, tmp_dir, lame_bin=None):
-    """ Subprocess worker to downconvert file
+    def _sync_deletions(self, deletions):
+        """ Sync deletions: Delete files and delete empty folders
+        """
+        for k, f in deletions.items():
+            self.logger.info('Deleting file %s' % f)
+            if not self.dry_run:
+                os.unlink(f)
+
+            # Keep file and folder lists in sync
+            self.destination_files.remove(f)
+            if self.tracks_per_folder != 0:
+                folder_name = os.path.basename(os.path.dirname(f))
+                folder_number = self._extract_folder_number(folder_name)
+                self.destination_folders[folder_number] -= 1
+
+        # Delete empty folders
+        if self.tracks_per_folder != 0:
+            for folder_number, file_count in self.destination_folders.items():
+                if file_count == 0:
+                    folder_path = os.path.join(self.destination, self.folder_name % folder_number)
+                    if not self.dry_run:
+                        os.rmdir(folder_path)
+                    del self.destination_folders[folder_number]
+                    self.logger.info('Deleting folder %s' % folder_path)
+
+    def _extract_folder_number(self, folder):
+        """ Extract folder number from name
+        """
+        try:
+            folder_name_format = self.folder_name.replace('%d', r'(\d+)')
+            return int(re.findall(r'^%s$' % folder_name_format, folder)[0])
+        except IndexError:
+            return None  # Folder name doesn't match format
+
+
+class PlaylistCopyStats():
+    """ Build stats for tracks in destination
     """
-    logger = mp.get_logger()
-    while True:
-        item = convert_queue.get()
-        temp_path = os.path.join(tmp_dir, item[0])
-        converted = False
+    def __init__(self, destination):
+        self.destination = destination
+        self.tracks = {}
 
-        if lame_bin is not None:
-            if item[0].endswith('mp3'):
-                lame_params = [lame_bin, '-b 128', '--silent', item[1], temp_path]
-                logger.info('Execute lame %s' % lame_params)
-                subprocess.call(lame_params)
-                logger.info('Finished executing lame %s' % lame_params)
-                converted = True
+    def _get_tracks(self):
+        """ Walk through all files and folders
+        """
+        from hsaudiotag import auto  # hsaudiotag3k
+        for root, dirs, files in os.walk(self.destination):
+            for file in files:
+                path = os.path.join(root, file)
+                tags = auto.File(path)
+                if not tags.valid:
+                    print(path)
+                    continue
 
-        if not converted:
-            # TODO Don't copy, just rename
-            logger.info('No converting for %s' % item[0])
-            shutil.copyfile(item[1], temp_path)
+                artist = tags.artist.strip()
+                if not artist:
+                    artist = 'Unknown artist'
+                album = tags.album.strip()
+                if not album:
+                    album = '_'
+                title = tags.title.strip()
+                if not title:
+                    title = 'Unknown track'
 
-        copy_queue.put((temp_path, item[2]))
-        convert_queue.task_done()
+                if artist not in self.tracks:
+                    self.tracks[artist] = {}
+                if album not in self.tracks[artist]:
+                    self.tracks[artist][album] = []
+
+                self.tracks[artist][album].append(title)
+
+    def group_by_artist(self):
+        """ Sum by artists
+        """
+        artist_track_count = {}
+        track_count = 0
+        for artist, albums in self.tracks.items():
+            for album, tracks in albums.items():
+                if artist not in artist_track_count:
+                    artist_track_count[artist] = 0
+                artist_track_count[artist] += len(tracks)
+                track_count += len(tracks)
+        return track_count, artist_track_count
+
+    def print_stats(self):
+        """ Print stats (console)
+        """
+        self._get_tracks()
+        track_count, artist_track_count = self.group_by_artist()
+        print('Tracks in total: %d\n' % track_count)
+
+        keys = list(artist_track_count.keys())
+        keys.sort()
+        for k in keys:
+            percent = artist_track_count[k] / track_count * 100
+            print('%s: %s (%.2f%%)' % (k, artist_track_count[k], percent))
 
 
-def _move_job(copy_queue, todo_tracks, done_tracks, quiet=False):
-    """ Subprocess worker to move a file to destination
-    """
-    logger = mp.get_logger()
-    while True:
-        item = copy_queue.get()
-        logger.info('Copy file %s to %s' % (item[0], item[1]))
+class ArgumentParser():
+    def __init__(self):
+        self.parser = argparse.ArgumentParser()
+        self.parser.add_argument('-V', '--version', action='version', version='%(prog)s 0.2',
+                                 help='print version and exit')
 
-        if os.path.isfile(item[0]):
-            # TODO: On OSError-exception, kill everything
-            # Use copyfile instead of move because move fails sometimes
-            shutil.copyfile(item[0], item[1])
-            logger.info('Finished copying of file %s' % item[0])
-            os.unlink(item[0])  # There is rmtree, but do this anyway
-        else:
-            # Something has happened to tmp dir?
-            logger.error('Skipped copying of file (missing file) %s' % item[0])
+        self.subparsers = self.parser.add_subparsers(dest='task')
+        self._add_parser('sync')
+        self._add_parser('append')
+        #self._add_parser('reshuffle')
+        self._add_parser('stats')
 
-        if not quiet:
-            with done_tracks.get_lock():
-                done_tracks.value += 1
-                f = (done_tracks.value, todo_tracks,
-                     done_tracks.value / todo_tracks * 100)
-                print('Finished track %d/%d (%.2f%%)' % f)
+    def parse_args(self):
+        args = self.parser.parse_args()
+        if args.task in ('sync', 'append'):
+            plc = PlaylistCopy(args.destination, args.playlists, args.task,
+                               rewrite_file_names=not args.no_rewrite_filenames,
+                               tracks_per_folder=args.tracks_per_folder, shuffle=args.shuffle,
+                               folder_name=args.folder_names, verbose=args.verbose,
+                               dry_run=args.dry_run)
+            plc.run()
+        elif args.task == 'stats':
+            plcs = PlaylistCopyStats(args.destination)
+            plcs.print_stats()
+        if args.task is None:
+            self.parser.print_help()
 
-        copy_queue.task_done()
+    def _add_parser(self, name):
+        parser = self.subparsers.add_parser(name)
+        parser.add_argument('destination', help='path to destination (e.g. usb storage)')
+        if name in ('sync', 'append'):
+            parser.add_argument('--dry-run', '-n', action='store_true',
+                                help='only make a trial run (no copying and deletion)')
+            parser.add_argument('--no-rewrite-filenames', action='store_true',
+                                help='don\'t rewrite filenames (no use of file tags)')
+            parser.add_argument('--shuffle', action='store_true',
+                                help='shuffle tracks in destination (only new tracks, for tracks-per-folder)')
+            #parser.add_argument('--reshuffle', action='store_true', help='reshuffle all tracks in destination')
+            parser.add_argument('--tracks-per-folder', default=0, type=int,
+                                help='maximum track count per folder (default 0, 0 = single folder)')
+            parser.add_argument('playlists', metavar='playlist', nargs='+',
+                                help='path to playlist files, multiple playlists possible (m3u)')
+        parser.add_argument('--folder-names', default='Folder %d',
+                            help='format for folder names (for tracks-per-folder, default: "%(default)s")')
+        parser.add_argument('-v', '--verbose', action='store_true',
+                            help='show output for all track actions')
 
 
 def main():
-    """ Argument parser for command line support
-    """
-    description = 'Script for copying playlist tracks (M3U/M3U8) to a destination device'
-    parser = argparse.ArgumentParser(description=description)
-
-    parser.add_argument('--convert-workers', default=1, type=int,
-                        help='jobs for converting tracks down (default 1)')
-    parser.add_argument('--lame',
-                        help='path to LAME binary to down convert tracks (128 kbps)')
-    parser.add_argument('--move-workers', default=1, type=int,
-                        help='jobs for moving files (default 1)')
-    parser.add_argument('--no-randomize', action='store_true',
-                        help='don\'t copy tracks randomized to destination')
-    parser.add_argument('-q', '--quiet', action='store_true',
-                        help='suppress normal output')
-    parser.add_argument('--tracks-per-dir', default=0, type=int,
-                        help='maximum track count per directory (default 0, 0 = single folder)')
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='show output for all track actions')
-    parser.add_argument('-V', '--version', action='version', version='%(prog)s 0.1',
-                        help='print version and exit')
-
-    parser.add_argument('destination',
-                        help='path to destination (e.g. usb storage)')
-    parser.add_argument('playlists', metavar='playlist', nargs='+',
-                        help='path to playlist files, multiple playlists possible (M3U/M3U8)')
-
-    args = parser.parse_args()
-
-    if args.verbose:
-        mp.log_to_stderr()
-        logger = mp.get_logger()
-        logger.setLevel(logging.INFO)
-
-    pc = PlaylistCopy(dst_dir=args.destination, playlists=args.playlists,
-                      lame_bin=args.lame, tracks_per_dir=args.tracks_per_dir,
-                      randomize_tracks=not args.no_randomize,
-                      convert_jobs=args.convert_workers,move_jobs=args.move_workers,
-                      quiet=args.quiet)
-    pc.run()
+    parser = ArgumentParser()
+    parser.parse_args()
 
 
 if __name__ == '__main__':

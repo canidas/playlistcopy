@@ -1,67 +1,74 @@
 playlistcopy
-------------
-
-playlistcopy is a Python 3 program for randmomized copying tracks
-playlist of (M3U/M3U8) to a destination device.
-
-playlistcopy creates new file names for the tracks from artist name and track
-title of ID3 tags (with help of
-`hsaudiotag3k <https://pypi.python.org/pypi/hsaudiotag3k>`_). So it's
-important to have maintained ID3 tags!
-
-playlistcopy can also down convert MP3 tracks (with help of
-`LAME <http://lame.sourceforge.net/>`_ and can split tracks to single
-directories with a maximum track count per directory. It has the ability to
-execute this conversion and copying with help of multiprocessing for better
-speed. This number of processes is adjustable.
-
-The script has *some* sync functionality: It adds missing directories (count)
-and places new tracks in not full directories. It skips tracks with same
-artist and same title of same playlist (but recognizes multiple tracks of
-same artist and same title on same playlist). But this sync breaks the
-concept of implemented randomness. Currently it doesn't delete tracks being
-on, destination but not on playlist. It also doesn't move tracks on
-destination which would keep some kind of balance (see next section).
-
-Originally I wrote this script for my Kenwood car radio which only can
-recognize 255 tracks per directory (and 254 direcotires in total) on an
-USB-device. Regarding the copy slowness of USB 2 devices I implemented
-multiprocessing. The placement of tracks is randomized because the random
-alogrithm of Kenwood devices seem to only randomize files but not directories.
-I made some things optional in the hope that somebody could use it for
-other features playlistcopy has also built in.
-
-License
-=======
-
-playlistcopy is licensed under the terms of GPLv3+.
-
-Dependencies
 ============
 
-* Python 3.1 (at least)
-* hsaudiotag3k
-* chardet (optional)
+playlistcopy is a Python 3 program for merging and copying (and syncing)
+several tracks of several playlists (m3u/m3u8) to a destination device,
+even splitted in folders and shuffled.
 
-Usage
-=====
+Per default playlistcopy rewrites file names to artist - album - track
+(with help of `hsaudiotag3k <https://pypi.python.org/pypi/hsaudiotag3k>`_)
+so it's important to have correct file tags. It also handles not unique
+source tracks (if the same track is on several playlists). A track is
+identified by its file name (rewritten one from tags or real filename
+if disabled).
+
+playlistcopy has two possible modes: *sync* and *append*. In *sync* mode
+**playlistcopy removes all files which are not on the given playlists**!
+In comparison to *sync*, *append* does not do any deletion.
+
+Originally I wrote this script for my Kenwood car radio which only recognizes
+255 tracks per folder (and 254 folders in total) on an USB-device. Nobody
+wants to split thousands of tracks by hand…
+
+Tasks
+-----
+
+sync, append
+~~~~~~~~~~~~
+
+Sync or append. See above.
+
 ::
 
-    playlistcopy [PARAMETERS] destination playlist [playlist ...]
+    playlistcopy task [PARAMETERS] destination playlist [playlist ...]
 
-Parameters
-==========
+===========================  ========================================================================
+``--dry-run, -n``             Only make a trial run (No copying and deletion)
+``--no-rewrite-filenames``    Don't rewrite filenames (No use of file tags)
+``--shuffle``                 Shuffle tracks in destination (Only new tracks, for tracks-per-folder)
+``--tracks-per-folder``       Maximum track count per folder (default 0, 0 = single folder)
+``--folder-names``            Format for folder names (for tracks-per-folder, default: "Folder %d")
+``destination``               Path to destination (e.g. usb storage)
+``playlist [...]``            Path to playlist file; multiple playlists possible (M3U/M3U8)
+===========================  ========================================================================
+
+stats
+~~~~~
+
+Stats about tracks in destination. Currently only sums track count per artist
+(including percentage).
+
+::
+
+    playlistcopy stats destination
+
+Common Arguments
+~~~~~~~~~~~~~~~~
 
 ======================  ==================================================================
 ``--help, -h``           Print help and exit
-``--convert-workers``    Jobs for converting tracks down (default 1)
-``--lame``               Path to LAME binary to down convert tracks (128 kbps)
-``--move-workers``       Jobs for moving files (default 1)
-``--no-randomize``       Don't copy tracks randomized to destination
-``--quiet, -q``          Suppress normal output
-``--tracks-per-dir``     Maximum track count per directory (default 0, 0 = single folder)
-``--verbose, -v``        Show output for all actions of tracks
+``--verbose, -v``        Show output for all actions of tracks (follows after task!)
 ``--version, -V``        Print version and exit
-``destination``          Path to destination (e.g. usb storage)
-``playlist [...]``       Path to playlist file, multiple playlists possible (M3U/M3U8)
 ======================  ==================================================================
+
+Dependencies
+------------
+
+* Python 3.1 (at least)
+* hsaudiotag3k (semi-optional)
+* chardet (optional)
+
+License
+-------
+
+playlistcopy is licensed under the terms of GPLv3+.

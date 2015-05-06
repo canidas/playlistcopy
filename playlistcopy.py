@@ -168,6 +168,8 @@ class PlaylistCopy:
     def _sync(self):
         """ Sync: Get additions and deletions, shuffling, execute sync
         """
+        self.logger.warning('All playlists have %d tracks' % len(self.playlists_files))
+
         additions, deletions = self._compare()
 
         if self.mode == 'sync':

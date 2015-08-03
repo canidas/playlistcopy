@@ -45,12 +45,16 @@ Sync or append. See above.
 stats
 ~~~~~
 
-Stats about tracks in destination. Currently only sums track count per artist
+Stats about tracks in destination. Sums by track count per artist or per track
 (including percentage).
 
 ::
 
     playlistcopy stats destination
+
+===============  ============================================
+``--group-by``    Group by ``artist`` (default) or ``track``
+===============  ============================================
 
 Common Arguments
 ~~~~~~~~~~~~~~~~

@@ -291,8 +291,9 @@ class PlaylistCopy:
 class PlaylistCopyStats():
     """ Build stats for tracks in destination
     """
-    def __init__(self, destination):
+    def __init__(self, destination, group_by='artist'):
         self.destination = destination
+        self.group_by = group_by
         self.tracks = {}
 
     def _get_tracks(self):
@@ -304,7 +305,7 @@ class PlaylistCopyStats():
                 path = os.path.join(root, file)
                 tags = auto.File(path)
                 if not tags.valid:
-                    print(path)
+                    #print(path)
                     continue
 
                 artist = tags.artist.strip()
@@ -324,31 +325,63 @@ class PlaylistCopyStats():
 
                 self.tracks[artist][album].append(title)
 
+    def get_track_count(self):
+        """ Complete track count
+        """
+        track_count = 0
+        for artist, albums in self.tracks.items():
+            for album, tracks in albums.items():
+                track_count += len(tracks)
+        return track_count
+
     def group_by_artist(self):
         """ Sum by artists
         """
         artist_track_count = {}
-        track_count = 0
         for artist, albums in self.tracks.items():
             for album, tracks in albums.items():
                 if artist not in artist_track_count:
                     artist_track_count[artist] = 0
                 artist_track_count[artist] += len(tracks)
-                track_count += len(tracks)
-        return track_count, artist_track_count
+        return artist_track_count
+
+    def group_by_title(self):
+        """ Sum by tracks (title: artist, album, track title)
+        """
+        track_count = {}
+        for artist, albums in self.tracks.items():
+            for album, tracks in albums.items():
+                for track in tracks:
+                    title = '%s - %s - %s' % (artist, album, track)
+                    if title not in track_count:
+                        track_count[title] = 0
+                    track_count[title] += 1
+        return track_count
 
     def print_stats(self):
-        """ Print stats (console)
+        """ Print stats (to console)
         """
         self._get_tracks()
-        track_count, artist_track_count = self.group_by_artist()
-        print('Tracks in total: %d\n' % track_count)
+        all_tracks = self.get_track_count()
 
-        keys = list(artist_track_count.keys())
-        keys.sort()
-        for k in keys:
-            percent = artist_track_count[k] / track_count * 100
-            print('%s: %s (%.2f%%)' % (k, artist_track_count[k], percent))
+        print('Tracks total: %d\n' % all_tracks)
+
+        if self.group_by == 'artist':
+            artist_track_count = self.group_by_artist()
+            keys = list(artist_track_count.keys())
+            keys.sort()
+            for k in keys:
+                percent = artist_track_count[k] / all_tracks * 100
+                print('%s: %s (%.2f%%)' % (k, artist_track_count[k], percent))
+        elif self.group_by == 'track':
+            track_count = self.group_by_title()
+            for track in sorted(track_count, key=track_count.get):
+                if track_count[track] == 1:
+                    continue
+                percent = track_count[track] / all_tracks * 100
+                print('%dx %s (%.2f%%)' % (track_count[track], track, percent))
+        else:
+            raise NotImplementedError()
 
 
 class ArgumentParser():
@@ -373,7 +406,7 @@ class ArgumentParser():
                                dry_run=args.dry_run)
             plc.run()
         elif args.task == 'stats':
-            plcs = PlaylistCopyStats(args.destination)
+            plcs = PlaylistCopyStats(args.destination, group_by=args.group_by)
             plcs.print_stats()
         if args.task is None:
             self.parser.print_help()
@@ -393,8 +426,11 @@ class ArgumentParser():
                                 help='maximum track count per folder (default 0, 0 = single folder)')
             parser.add_argument('playlists', metavar='playlist', nargs='+',
                                 help='path to playlist files, multiple playlists possible (m3u)')
-        parser.add_argument('--folder-names', default='Folder %d',
-                            help='format for folder names (for tracks-per-folder, default: "%(default)s")')
+            parser.add_argument('--folder-names', default='Folder %d',
+                                help='format for folder names (for tracks-per-folder, default: "%(default)s")')
+        if name == 'stats':
+            parser.add_argument('--group_by', type=str, choices=['artist', 'track'], default='artist',
+                                help='only make a trial run (no copying and deletion)')
         parser.add_argument('-v', '--verbose', action='store_true',
                             help='show output for all track actions')
 

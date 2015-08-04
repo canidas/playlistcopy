@@ -36,11 +36,31 @@ Sync or append. See above.
 ``--dry-run, -n``             Only make a trial run (No copying and deletion)
 ``--no-rewrite-filenames``    Don't rewrite filenames (No use of file tags)
 ``--shuffle``                 Shuffle tracks in destination (Only new tracks, for tracks-per-folder)
+``--reshuffle``               Perform reshuffle after sync or append
 ``--tracks-per-folder``       Maximum track count per folder (default 0, 0 = single folder)
 ``--folder-names``            Format for folder names (for tracks-per-folder, default: "Folder %d")
 ``destination``               Path to destination (e.g. usb storage)
 ``playlist [...]``            Path to playlist file; multiple playlists possible (M3U/M3U8)
 ===========================  ========================================================================
+
+reshuffle
+~~~~~~~~~
+
+Randomly move all files between all existing destination folders
+(according format for folder name). This is usually needed after
+a sync with shuffle as sync/append only fill all folders and place
+new tracks in new folders without any reshuffle.
+
+::
+
+    playlistcopy reshuffle [PARAMETERS] destination
+
+
+===================  =======================================================================
+``--dry-run, -n``     Only make a trial run (No copying and deletion)
+``--folder-names``    Format for folder names (for tracks-per-folder, default: "Folder %d")
+``destination``       Path to destination (e.g. usb storage)
+===================  =======================================================================
 
 stats
 ~~~~~
@@ -50,7 +70,7 @@ Stats about tracks in destination. Sums by track count per artist or per track
 
 ::
 
-    playlistcopy stats destination
+    playlistcopy stats [PARAMETERS] destination
 
 ===============  ============================================
 ``--group-by``    Group by ``artist`` (default) or ``track``

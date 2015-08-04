@@ -28,13 +28,14 @@ class PlaylistCopy:
         GPLv3+
     """
     def __init__(self, destination, playlists, mode='sync', rewrite_file_names=True, tracks_per_folder=0,
-                 shuffle=False, folder_name='Folder %d', verbose=False, dry_run=False):
+                 shuffle=False, reshuffle=False, folder_name='Folder %d', verbose=False, dry_run=False):
         self.destination = destination
         self.playlists = playlists
         self.mode = mode
         self.rewrite_file_names = rewrite_file_names
         self.tracks_per_folder = tracks_per_folder
         self.shuffle = shuffle
+        self.reshuffle = reshuffle
         self.folder_name = folder_name
         self.dry_run = dry_run
 
@@ -43,6 +44,7 @@ class PlaylistCopy:
         self.destination_files = []
         self.destination_folders = collections.OrderedDict()  # Number of files per folder
 
+        self.verbose = verbose
         self.logger = logging.Logger(__name__)
         level = logging.WARNING if not verbose else logging.DEBUG
         console = logging.StreamHandler()
@@ -60,6 +62,12 @@ class PlaylistCopy:
         self._build_destination_file_list()
 
         self._sync()
+
+        if self.reshuffle:
+            self.logger.warning('%s: PERFORMING RESHUFFLE' % self.__class__.__name__)
+            plcrs = PlaylistCopyReshuffle(self.destination, self.folder_name,
+                                          self.verbose, self.dry_run)
+            plcrs.run()
 
     def _parse_playlist(self, file):
         """ Parse a M3U playlist
@@ -179,7 +187,7 @@ class PlaylistCopy:
         self.logger.warning('%d additions, %s' % (len(additions), info_deletions))
 
         if self.dry_run:
-            self.logger.warning('PERFORMING DRY RUN')
+            self.logger.warning('%s: PERFORMING DRY RUN' % self.__class__.__name__)
 
         # In sync mode: delete files not matched
         if self.mode == 'sync':
@@ -221,7 +229,7 @@ class PlaylistCopy:
                 break
 
             if self.tracks_per_folder != 0:
-                folder_path = os.path.join(self.destination, self.folder_name % folder_count)
+                folder_path = self._create_folder_path(folder_count)
 
                 # Create needed folder which currently does not exist
                 if folder_count not in self.destination_folders:
@@ -272,7 +280,7 @@ class PlaylistCopy:
         if self.tracks_per_folder != 0:
             for folder_number, file_count in self.destination_folders.items():
                 if file_count == 0:
-                    folder_path = os.path.join(self.destination, self.folder_name % folder_number)
+                    folder_path = self._create_folder_path(folder_number)
                     if not self.dry_run:
                         os.rmdir(folder_path)
                     del self.destination_folders[folder_number]
@@ -286,6 +294,58 @@ class PlaylistCopy:
             return int(re.findall(r'^%s$' % folder_name_format, folder)[0])
         except IndexError:
             return None  # Folder name doesn't match format
+
+    def _create_folder_path(self, folder_number):
+        """ Create folder path based on format and folder number
+        """
+        return os.path.join(self.destination, self.folder_name % folder_number)
+
+
+class PlaylistCopyReshuffle(PlaylistCopy):
+    """ Reshuffle all files (randomly place in other folders)
+    """
+    def __init__(self, destination, folder_name='Folder %d', verbose=False, dry_run=False):
+        super().__init__(destination, [], tracks_per_folder=1, folder_name=folder_name,
+                         verbose=verbose, dry_run=dry_run)
+
+    def _allocate_files(self):
+        """ Determine where to place which file (use existing file count per folder)
+        """
+        stack = []
+        for file in self.destination_files:
+            skipped_folders = set()
+            while True:
+                # Randomly choose folder which is not full
+                random_folder_key = random.choice(list(self.destination_folders.keys()))
+                if self.destination_folders[random_folder_key] == 0:
+                    skipped_folders.add(random_folder_key)
+                    if len(skipped_folders) >= len(self.destination_folders):
+                        raise RuntimeError('All folders are full?')
+                else:
+                    self.destination_folders[random_folder_key] -= 1
+                    folder_path = self._create_folder_path(random_folder_key)
+                    new_path = os.path.join(folder_path, os.path.basename(file))
+                    if file != new_path and os.path.isfile(new_path):
+                        raise FileExistsError('File %s does already exist. Are file names unique? '
+                                              '(rewrite-filenames)' % new_path)
+                    stack.append((file, new_path))
+                    break
+        return stack
+
+    def run(self):
+        """ Move files
+        """
+        if self.dry_run:
+            self.logger.warning('%s: PERFORMING DRY RUN' % self.__class__.__name__)
+        self._build_destination_file_list()
+        stack = self._allocate_files()
+        files_done = 0
+        for entry in stack:
+            files_done += 1
+            percent = files_done / len(stack) * 100
+            self.logger.info('Moving file %s -> %s (%.2f%%)' % (entry[0], entry[1], percent))
+            if not self.dry_run:
+                shutil.move(entry[0], entry[1])
 
 
 class PlaylistCopyStats():
@@ -393,7 +453,7 @@ class ArgumentParser():
         self.subparsers = self.parser.add_subparsers(dest='task')
         self._add_parser('sync')
         self._add_parser('append')
-        #self._add_parser('reshuffle')
+        self._add_parser('reshuffle')
         self._add_parser('stats')
 
     def parse_args(self):
@@ -402,9 +462,13 @@ class ArgumentParser():
             plc = PlaylistCopy(args.destination, args.playlists, args.task,
                                rewrite_file_names=not args.no_rewrite_filenames,
                                tracks_per_folder=args.tracks_per_folder, shuffle=args.shuffle,
-                               folder_name=args.folder_names, verbose=args.verbose,
-                               dry_run=args.dry_run)
+                               reshuffle=args.reshuffle, folder_name=args.folder_names,
+                               verbose=args.verbose, dry_run=args.dry_run)
             plc.run()
+        elif args.task == 'reshuffle':
+            plcrs = PlaylistCopyReshuffle(args.destination, folder_name=args.folder_names,
+                                          verbose=args.verbose, dry_run=args.dry_run)
+            plcrs.run()
         elif args.task == 'stats':
             plcs = PlaylistCopyStats(args.destination, group_by=args.group_by)
             plcs.print_stats()
@@ -414,22 +478,23 @@ class ArgumentParser():
     def _add_parser(self, name):
         parser = self.subparsers.add_parser(name)
         parser.add_argument('destination', help='path to destination (e.g. usb storage)')
-        if name in ('sync', 'append'):
+        if name in ('sync', 'append', 'reshuffle'):
             parser.add_argument('--dry-run', '-n', action='store_true',
                                 help='only make a trial run (no copying and deletion)')
-            parser.add_argument('--no-rewrite-filenames', action='store_true',
-                                help='don\'t rewrite filenames (no use of file tags)')
-            parser.add_argument('--shuffle', action='store_true',
-                                help='shuffle tracks in destination (only new tracks, for tracks-per-folder)')
-            #parser.add_argument('--reshuffle', action='store_true', help='reshuffle all tracks in destination')
-            parser.add_argument('--tracks-per-folder', default=0, type=int,
-                                help='maximum track count per folder (default 0, 0 = single folder)')
-            parser.add_argument('playlists', metavar='playlist', nargs='+',
-                                help='path to playlist files, multiple playlists possible (m3u)')
             parser.add_argument('--folder-names', default='Folder %d',
                                 help='format for folder names (for tracks-per-folder, default: "%(default)s")')
+            if name in ('sync', 'append'):
+                parser.add_argument('--no-rewrite-filenames', action='store_true',
+                                    help='don\'t rewrite filenames (no use of file tags)')
+                parser.add_argument('--shuffle', action='store_true',
+                                    help='shuffle tracks in destination (only new tracks, for tracks-per-folder)')
+                parser.add_argument('--reshuffle', action='store_true', help='reshuffle all tracks in destination')
+                parser.add_argument('--tracks-per-folder', default=0, type=int,
+                                    help='maximum track count per folder (default 0, 0 = single folder)')
+                parser.add_argument('playlists', metavar='playlist', nargs='+',
+                                    help='path to playlist files, multiple playlists possible (m3u)')
         if name == 'stats':
-            parser.add_argument('--group_by', type=str, choices=['artist', 'track'], default='artist',
+            parser.add_argument('--group-by', type=str, choices=['artist', 'track'], default='artist',
                                 help='only make a trial run (no copying and deletion)')
         parser.add_argument('-v', '--verbose', action='store_true',
                             help='show output for all track actions')
